@@ -84,6 +84,7 @@ fn zero_histograms(@builtin(global_invocation_id) gid : vec3<u32>, @builtin(num_
         }
         else {
             keys[infos.keys_size + cur_index - b] = 0xFFFFFFFFu;
+            payload_a[infos.keys_size + cur_index - b] = 0u;
         }
     }
 }

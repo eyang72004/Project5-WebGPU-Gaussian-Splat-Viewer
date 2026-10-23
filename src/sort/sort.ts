@@ -29,7 +29,7 @@ function create_ping_pong_buffer(adjusted_count: number, keysize: number, device
     // payload
     sort_indices_buffer: device.createBuffer({
       label: 'ping pong sort indices',
-      size: keysize * 4,
+      size: adjusted_count * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     }),
     // key
