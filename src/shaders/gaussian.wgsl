@@ -53,6 +53,13 @@ var<storage, read> splats: array<Splat>;
 
 
 
+
+// Original Gaussian indices ordered by depth by the GPU radix sorter
+@group(0) @binding(1)
+var<storage, read> sorted_indices: array<u32>;
+
+
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
@@ -79,11 +86,19 @@ fn vs_main(
 
 
 
-    // Retrieve the projected center for this Gaussian instance
-    let center = splats[instance_index].center;
+    // Look up the original Gaussian index in the depth-sorted list
+    let gaussian_idx = sorted_indices[instance_index];
+
+
+
+
+    // Retrieve the projected center for this Gaussian
+    let center = splats[gaussian_idx].center;
+
+
 
     // Retrieve the inverse projected covariance for this Gaussian
-    let conic = splats[instance_index].conic;
+    let conic = splats[gaussian_idx].conic;
 
 
     // Recover the determinant of the inverse projected covariance
@@ -150,11 +165,11 @@ fn vs_main(
 
 
     // Pass the decoded per-Gaussian opacity to the fragment shader
-    out.opacity = splats[instance_index].opacity;
+    out.opacity = splats[gaussian_idx].opacity;
 
 
     // Pass the per-Gaussian RGB color to the fragment shader
-    out.color = splats[instance_index].color;
+    out.color = splats[gaussian_idx].color;
 
 
 
@@ -196,5 +211,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         in.color,
         alpha
     );
-    
+
 }

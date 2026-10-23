@@ -171,6 +171,12 @@ export default function get_renderer(
         binding: 0,
         resource: { buffer: splat_buffer },
       },
+      {
+        binding: 1,
+        resource: {
+          buffer: sorter.ping_pong[0].sort_indices_buffer,
+        },
+      },
     ],
   });
     
@@ -189,6 +195,13 @@ export default function get_renderer(
   const preprocess = (encoder: GPUCommandEncoder) => {
     // Reset the visible-Gaussian counter before each preprocessing dispatch
     encoder.clearBuffer(sorter.sort_info_buffer, 0, Uint32Array.BYTES_PER_ELEMENT);
+
+
+    // Reset the padded sorting length (second u32 in SortInfos)
+    encoder.clearBuffer(sorter.sort_info_buffer, Uint32Array.BYTES_PER_ELEMENT, Uint32Array.BYTES_PER_ELEMENT);
+
+    // Reset the indirect sorting workgroup count before each frame
+    encoder.clearBuffer(sorter.sort_dispatch_indirect_buffer, 0, Uint32Array.BYTES_PER_ELEMENT);
     
     const pass = encoder.beginComputePass({
       label: 'gaussian preprocessing'
@@ -215,6 +228,16 @@ export default function get_renderer(
 
     pass.dispatchWorkgroups(workgroup_count);
     pass.end();
+
+
+    // Copy the visible-Gaussian count into the indirect draw instance count
+    encoder.copyBufferToBuffer(
+      sorter.sort_info_buffer,
+      0,
+      indirect_draw_buffer,
+      Uint32Array.BYTES_PER_ELEMENT,
+      Uint32Array.BYTES_PER_ELEMENT
+    );
 
 
 
@@ -252,12 +275,16 @@ export default function get_renderer(
   // ===============================================
   return {
     frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
-      // Project all Gaussian centers into screen space
+      // Project Gaussians and generate depth keys
       preprocess(encoder);
 
 
+      // Sort visible Gaussians by depth using the provided GPU radix sorter
+      sorter.sort(encoder);
 
-      // Sorting will be enabled once valid depth keys are generated
+      
+
+      // Render Gaussian splats
       render(encoder, texture_view);
     },
     camera_buffer

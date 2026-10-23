@@ -293,6 +293,10 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
         let digit = extractBits(u_val, pass_ * rs_radix_log2, rs_radix_log2);
         // smem[lid.x] = digit;
         atomicStore(&smem[lid.x], digit);
+
+        workgroupBarrier();
+
+
         var count = 0u;
         var rank = 0u;
         
@@ -307,6 +311,8 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
         }
         
         kr[i] = (count << 16u) | rank;
+
+        workgroupBarrier();
     }
     
     zero_smem(lid.x);   // now zeroing the smmem as we are now accumulating the histogram there

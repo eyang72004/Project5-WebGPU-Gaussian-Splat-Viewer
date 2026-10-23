@@ -33,7 +33,7 @@ struct DispatchIndirect {
 struct SortInfos {
     keys_size: atomic<u32>,  // instance_count in DrawIndirect
     //data below is for info inside radix sort 
-    padded_size: u32, 
+    padded_size: atomic<u32>, 
     passes: u32,
     even_pass: u32,
     odd_pass: u32,
@@ -546,8 +546,20 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-        // Keep the indirect dispatch buffer active in the preprocessing pipeline
-        atomicAdd(&sort_dispatch.dispatch_x, 0u);
+        // Increase the sorting dispatch count once per block of visible Gaussians
+        let keys_per_dispatch = workgroupSize * sortKeyPerThread;
+
+        if (sort_idx % keys_per_dispatch == 0u) {
+            atomicAdd(&sort_dispatch.dispatch_x, 1u);
+        }
+
+
+
+        let required_padded_size = ((sort_idx / keys_per_dispatch) + 1u) * keys_per_dispatch;
+
+
+
+        atomicMax(&sort_infos.padded_size, required_padded_size);
 
 
 
@@ -599,6 +611,5 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-    let keys_per_dispatch = workgroupSize * sortKeyPerThread; 
-    // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
+    
 }
