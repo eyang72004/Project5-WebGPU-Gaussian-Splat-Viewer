@@ -53,6 +53,14 @@ struct RenderSettings {
     sh_deg: f32,
 }
 
+
+// User-adjustable Gaussian rendering parameters
+@group(0) @binding(4)
+var<uniform> render_settings: RenderSettings;
+
+
+
+
 struct Gaussian {
     pos_opacity: array<u32,2>,
     rot: array<u32,2>,
@@ -263,7 +271,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         scale_01.x,
         scale_01.y,
         scale_2.x
-    ));
+    )) * render_settings.gaussian_scaling;
 
 
 

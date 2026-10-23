@@ -5,7 +5,7 @@ import { get_sorter,c_histogram_block_rows,C } from '../sort/sort';
 import { Renderer } from './renderer';
 
 export interface GaussianRenderer extends Renderer {
-
+  setGaussianMultiplier: (value: number) => void;
 }
 
 // Utility to create GPU buffers
@@ -45,6 +45,24 @@ export default function get_renderer(
   );
 
   const nulling_data = new Uint32Array([0]);
+
+
+
+
+
+  // Gaussian rendering settings: gaussian_scaling and sh_deg
+  // Allocate 16 bytes to satisfy uniform-buffer alignment requirements
+  const render_settings_buffer = createBuffer(
+    device,
+    'gaussian render settings',
+    16,
+    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    new Float32Array([1.0, pc.sh_deg, 0.0, 0.0])
+  );
+
+
+
+
 
   // ===============================================
   //    Create Compute Pipeline and Bind Groups
@@ -87,6 +105,10 @@ export default function get_renderer(
       {
         binding: 3,
         resource: { buffer: pc.sh_buffer },
+      },
+      {
+        binding: 4,
+        resource: { buffer: render_settings_buffer },
       },
     ],
   });
@@ -287,6 +309,14 @@ export default function get_renderer(
       // Render Gaussian splats
       render(encoder, texture_view);
     },
-    camera_buffer
+    camera_buffer,
+
+    setGaussianMultiplier: (value: number) => {
+      device.queue.writeBuffer(
+        render_settings_buffer,
+        0,
+        new Float32Array([value])
+      );
+    }
   };
 }
