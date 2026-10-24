@@ -18,12 +18,21 @@ import { assert } from './utils/util';
     return;
   }
   
+  
   const device = await adapter.requestDevice({
-    requiredLimits: { 
+    requiredFeatures: adapter.features.has('timestamp-query')
+      ? ['timestamp-query']
+      : [],
+    requiredLimits: {
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxStorageBufferBindingSize: adapter.limits. maxStorageBufferBindingSize
-     },
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    },
   });
+
+  console.log(
+    'GPU timestamp queries enabled:',
+    device.features.has('timestamp-query')
+  );
 
   const canvas = document.querySelector<HTMLCanvasElement>('#webgpu-canvas');
   assert(canvas !== null);
