@@ -1,14 +1,16 @@
 enable f16;
-const SH_C0: f32 = 0.28209479177387814;
-const SH_C1 = 0.4886025119029199;
-const SH_C2 = array<f32,5>(
+
+// SH basis constants, rounded to f16 for native half-precision color evaluation
+const SH_C0: f16 = 0.28209479177387814;
+const SH_C1: f16 = 0.4886025119029199;
+const SH_C2 = array<f16,5>(
     1.0925484305920792,
     -1.0925484305920792,
     0.31539156525252005,
     -1.0925484305920792,
     0.5462742152960396
 );
-const SH_C3 = array<f32,7>(
+const SH_C3 = array<f16,7>(
     -0.5900435899266435,
     2.890611442640554,
     -0.4570457994644658,
@@ -17,6 +19,9 @@ const SH_C3 = array<f32,7>(
     1.445305721320277,
     -0.5900435899266435
 );
+
+// Largest argument passed to f16 exp(), kept below ln(65504) ~= 11.09 (the f16 overflow point) with headroom for the exp() error bound, so the result is always finite
+const F16_EXP_MAX_ARG: f16 = 10.5;
 
 override workgroupSize: u32;
 override sortKeyPerThread: u32;
@@ -124,7 +129,7 @@ var<uniform> camera: CameraUniforms;
 
 
 
-// Projected Gaussian centers written by the compute shader
+// Compressed 2D splats (f32 center and conic, f16-packed opacity and RGB) written by the compute shader
 @group(0) @binding(2)
 var<storage, read_write> splats: array<Splat>;
 @group(2) @binding(0)
@@ -136,8 +141,8 @@ var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
 
-/// reads the ith sh coef from the storage buffer
-fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
+/// reads the ith sh coef from the storage buffer as native f16 values
+fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f16> {
     //TODO: access your binded sh_coeff, see load.ts for how it is stored
 
 
@@ -149,9 +154,10 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
 
 
 
-    // Each u32 contains two consecutive f16 values
-    let packed_0 = unpack2x16float(sh_coeffs[base / 2u]);
-    let packed_1 = unpack2x16float(sh_coeffs[(base + 2u) / 2u]);
+    // Each u32 contains two consecutive f16 values; bitcast reinterprets them without conversion
+    // Component .x is the low 16 bits (the lower-addressed f16), matching unpack2x16float
+    let packed_0 = bitcast<vec2<f16>>(sh_coeffs[base / 2u]);
+    let packed_1 = bitcast<vec2<f16>>(sh_coeffs[(base + 2u) / 2u]);
 
 
 
@@ -162,7 +168,7 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     if ((base % 2u) == 0u) {
 
 
-        return vec3<f32>(packed_0.x, packed_0.y, packed_1.x);
+        return vec3<f16>(packed_0.x, packed_0.y, packed_1.x);
     }
 
 
@@ -170,7 +176,7 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
 
 
 
-    return vec3<f32>(
+    return vec3<f16>(
         packed_0.y,
         packed_1.x,
         packed_1.y
@@ -179,8 +185,11 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
 
 }
 
-// spherical harmonics evaluation with Condon–Shortley phase
-fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
+// spherical harmonics evaluation with Condon–Shortley phase, using native f16 arithmetic
+// dir_f32 must already be normalized in f32; its components lie in [-1, 1] and convert to f16 safely
+fn computeColorFromSH(dir_f32: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
+    let dir = vec3<f16>(dir_f32);
+
     var result = SH_C0 * sh_coef(v_idx, 0u);
 
     if sh_deg > 0u {
@@ -209,13 +218,15 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
     }
     result += 0.5;
 
-    return  max(vec3<f32>(0.), result);
+    // Clamp in f16, then widen exactly to f32 for pack2x16float
+    return vec3<f32>(max(vec3<f16>(0.0), result));
 }
 
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
     //TODO: set up pipeline as described in instruction
+
 
 
     // Prevent invocations in the final workgroup from reading beyond the allocated Gaussian input buffer
@@ -239,6 +250,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     // Compute the viewing direction from the camera toward this Gaussian
+    // Normalize in f32: squared world-space distances can exceed the f16 range
     let view_direction = normalize(world_pos.xyz - camera_world_pos);
 
 
@@ -247,14 +259,12 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Perform opacity decoding using native half-precision arithmetic
     let opacity_raw = f16(zo.y);
 
+    // exp(-x) overflows f16 for x < -ln(65504), so bound the logit from below
+    // At the bound the sigmoid is ~2.8e-5, far below one 8-bit alpha step, so the clamp is not visible
+    // Large positive logits need no bound: exp(-x) underflows harmlessly toward 0 and the sigmoid rounds to 1
+    let opacity_half = 1.0h / (1.0h + exp(-max(opacity_raw, -F16_EXP_MAX_ARG)));
 
-
-    let opacity_half = 1.0h / (1.0h + exp(-opacity_raw));
-
-
-
-
-    // Convert to f32 for compatibility with the existing Splat buffer
+    // Widen exactly to f32 for pack2x16float
     let opacity = f32(opacity_half);
 
 
@@ -292,7 +302,10 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-    let scale_half = exp(log_scale_half);
+    // exp(s) overflows f16 for s > ln(65504); an infinite scale would turn the covariance into NaN (inf * 0)
+    // The bound caps scales at ~3.6e4 world units, far beyond any trained Gaussian, so real scenes are unaffected
+    // Very negative log-scales may underflow to f16 subnormals or zero; those Gaussians are already dominated by the projected-covariance regularization below, so no lower bound is applied
+    let scale_half = exp(min(log_scale_half, vec3<f16>(F16_EXP_MAX_ARG)));
 
 
 
@@ -344,8 +357,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     // Extract the linear transformation from the camera view matrix
-    // WGSL matrices are column-major, so the first three columns
-    // contain the 3D linear transformation without translation
+    // WGSL matrices are column-major, so the first three columns contain the 3D linear transformation without translation
     let W = mat3x3<f32>(
         camera.view[0].xyz,
         camera.view[1].xyz,
@@ -470,8 +482,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     // Compute the inverse covariance coefficients (the conic)
-    // For invalid covariance matrices, use zero as a temporary fallback
-    // Final visibility handling will be implemented later
+    // Invalid covariance matrices keep a zero conic; such Gaussians are rejected by valid_projection below
     var conic = vec3<f32>(0.0, 0.0, 0.0);
 
     if (valid_covariance) {
@@ -552,9 +563,8 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-    // Diagnostic extent-aware visibility filtering
-    // The three-sigma projected radius allows Gaussians whose centers lie outside the viewport to remain visible if their footprints overlap
-    // Visible-instance compaction will be implemented later
+    // Validity checks that always apply, independent of the frustum-culling toggle: the center must be in front of the camera, within the near/far depth range, and have an invertible covariance
+    // When enableFrustumCulling is 1, gaussian_in_frustum additionally requires the three-sigma footprint to overlap the viewport
     let valid_projection =
     clip_pos.w > 0.00001 &&
     clip_pos.z >= 0.0 &&
@@ -614,7 +624,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-        // Evaluate view-dependent RGB color
+        // Evaluate view-dependent RGB color using native f16 SH arithmetic
         let color = computeColorFromSH(view_direction, idx, shDegree);
 
 
@@ -631,6 +641,8 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     } else {
+        // Rejected Gaussians are not appended to the sort list, so they are not drawn
+        // Clear their splat entry so the buffer never holds stale data
         splats[idx].center = vec2<f32>(10.0, 10.0);
 
 

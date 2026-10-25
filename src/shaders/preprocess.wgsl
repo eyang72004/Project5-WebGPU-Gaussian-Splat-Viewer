@@ -71,6 +71,8 @@ struct Gaussian {
 };
 
 struct Splat {
+    //TODO: store information for 2D splat rendering
+
     // Projected Gaussian center in normalized device coordinates
     center: vec2<f32>,
 
@@ -87,6 +89,8 @@ struct Splat {
     color: vec3<f32>,
 
 };
+
+//TODO: bind your data here
 
 
 // Spherical harmonics coefficients packed as half-precision RGB values
@@ -125,6 +129,10 @@ var<storage, read_write> sort_dispatch: DispatchIndirect;
 
 /// reads the ith sh coef from the storage buffer
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
+    //TODO: access your binded sh_coeff, see load.ts for how it is stored
+
+
+
     // Each Gaussian contains 16 RGB coefficients, or 48 f16 values
     // Coefficients are stored in RGB-interleaved order
     let base = splat_idx * 48u + c_idx * 3u;
@@ -198,6 +206,7 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
+    //TODO: set up pipeline as described in instruction
 
 
     // Prevent invocations in the final workgroup from reading beyond the allocated Gaussian input buffer
@@ -312,8 +321,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     // Extract the linear transformation from the camera view matrix
-    // WGSL matrices are column-major, so the first three columns
-    // contain the 3D linear transformation without translation
+    // WGSL matrices are column-major, so the first three columns contain the 3D linear transformation without translation
     let W = mat3x3<f32>(
         camera.view[0].xyz,
         camera.view[1].xyz,
@@ -519,8 +527,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-    // Validity checks that always apply, independent of the frustum-culling toggle:
-    // the center must be in front of the camera, within the near/far depth range, and have an invertible covariance
+    // Validity checks that always apply, independent of the frustum-culling toggle: the center must be in front of the camera, within the near/far depth range, and have an invertible covariance
     // When enableFrustumCulling is 1, gaussian_in_frustum additionally requires the three-sigma footprint to overlap the viewport
     let valid_projection =
     clip_pos.w > 0.00001 &&
@@ -579,8 +586,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         // Store the decoded opacity for fragment-stage Gaussian blending
         splats[idx].opacity = opacity;
 
-        // Evaluate view-dependent RGB color using the spherical harmonics degree
-        // supplied by the loaded Gaussian data through the pipeline override
+        // Evaluate view-dependent RGB color using the spherical harmonics degree supplied by the loaded Gaussian data through the pipeline override
         splats[idx].color = computeColorFromSH(view_direction, idx, shDegree);
 
 

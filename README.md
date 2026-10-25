@@ -41,7 +41,7 @@ A major focus of this project is performance analysis. I implemented GPU timesta
 - **Gaussian Count Selection:** Supports loading 25%, 50%, 75%, or 100% of a PLY scene to evaluate performance scaling.
 - **Camera Controls:** Supports interactive camera navigation and camera presets loaded from JSON files.
 - **GPU Performance Benchmarking:** Uses WebGPU timestamp queries to measure GPU execution time and export individual measurements as CSV files.
-- **Half-Precision Gaussian Preprocessing (+10 Extra Credit):** Implements an optional `shader-f16` preprocessing path with selected native half-precision arithmetic and a compressed 32-byte intermediate splat representation, compared with the 48-byte baseline.
+- **Half-Precision Gaussian Preprocessing (+10 Extra Credit):** Implements an optional `shader-f16` preprocessing path with native half-precision spherical-harmonics color, opacity, and scale evaluation and a compressed 32-byte intermediate splat representation, compared with the 48-byte baseline.
 - **Precision Benchmarking:** Automatically compares f32 and f16 rendering using GPU timestamp queries and exports per-sample CSV results.
 
 
@@ -99,7 +99,15 @@ The fractional configurations use the first N Gaussians in the PLY file rather t
 
 I implemented a half-precision Gaussian preprocessing path using WebGPU's `shader-f16` feature. The original f32 pipeline is preserved as a baseline, and the viewer provides a precision selector to switch between the two implementations.
 
-The f16 preprocessing shader uses native half-precision arithmetic for selected operations, including opacity sigmoid evaluation and exponentiation of Gaussian scales. Projection, covariance calculations, and other geometry-sensitive operations remain in f32 to avoid introducing unnecessary numerical error.
+The f16 preprocessing shader (`preprocess_f16.wgsl`) uses native half-precision arithmetic for three per-Gaussian calculations:
+
+- **Spherical-harmonics color evaluation.** SH coefficients are already stored as f16 by the loader, so each packed `u32` is reinterpreted with `bitcast<vec2<f16>>` instead of being widened to f32. The view direction is normalized in f32 (squared world-space distances can exceed the f16 range) and then converted to f16, after which the full degree-0 to degree-3 SH evaluation, the `+0.5` offset, and the clamp to non-negative values are performed in f16 using f16-rounded basis constants. The SH basis, coefficient ordering, and clamping match the f32 shader.
+- **Opacity sigmoid.** `1 / (1 + exp(-x))` is evaluated in f16. Because `exp(-x)` overflows f16 when `x < -ln(65504) ≈ -11.09`, the logit is clamped from below at -10.5, where the sigmoid is about 2.8e-5, far below one 8-bit alpha step.
+- **Scale exponentiation.** `exp(log_scale)` is evaluated in f16, with the log-scale clamped from above at 10.5 (a scale of about 3.6e4 world units). Without this bound, an overflowed scale would make the covariance NaN (`inf * 0`). Very small scales may underflow to f16 subnormals or zero; no lower bound is applied because such Gaussians are already dominated by the projected-covariance regularization.
+
+Covariance construction, the view and perspective projection, conic inversion, frustum and validity decisions, and depth-sort keys remain in f32 to avoid introducing geometric error. Final opacity and color are widened exactly to f32 only so they can be packed with `pack2x16float`.
+
+f16 SH evaluation carries roughly three significant decimal digits, so colors can differ from the f32 baseline by a fraction of an 8-bit step, and occasionally by one step after accumulated rounding. Opacity and color were already quantized to f16 by the compressed splat format before this change.
 
 The optimized pipeline also compresses the intermediate splat representation from 48 bytes to 32 bytes per Gaussian. Projected centers and inverse covariance coefficients remain in f32, while opacity and RGB color are packed into four 16-bit floating-point values using `pack2x16float`. A separate rendering shader decodes these values using `unpack2x16float`.
 
@@ -323,6 +331,8 @@ The optimization reduces the intermediate splat representation from 48 bytes to 
 Therefore, the results do not establish that preprocessing itself is 1.43% faster or that total GPU memory usage is reduced by 33.3%. Additional experiments would be required to isolate the individual contributions of half-precision arithmetic and compressed memory accesses.
 
 The results also reflect three sequential f32-then-f16 benchmark runs on one GPU. Although the improvement was consistent across these runs, GPU clock variation, temperature, and benchmark order may influence the measured differences.
+
+These measurements were collected before spherical-harmonics color evaluation was moved to f16 and before the f16 `exp()` range clamps were added. In that earlier version, only the opacity sigmoid and scale exponentiation used f16 arithmetic. The current f16 shader has not been re-benchmarked, so the table above should not be read as a measurement of it.
 
 
 

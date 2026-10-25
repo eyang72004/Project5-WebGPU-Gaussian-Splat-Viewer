@@ -60,8 +60,7 @@ export default function get_renderer(
   // ===============================================
 
 
-  // Each intermediate splat occupies 48 bytes:
-  // vec2<f32> center at offset 0, vec3<f32> conic at offset 16, f32 opacity at offset 28, and vec3<f32> color at offset 32, including padding required by WGSL storage-buffer alignment
+  // Each intermediate splat occupies 48 bytes: vec2<f32> center at offset 0, vec3<f32> conic at offset 16, f32 opacity at offset 28, and vec3<f32> color at offset 32, including padding required by WGSL storage-buffer alignment
   const splat_buffer = createBuffer(
     device,
     'projected Gaussian splats',
@@ -264,11 +263,10 @@ export default function get_renderer(
   //    Create Render Pipeline and Bind Groups
   // ===============================================
 
-  // Four u32 values required by WebGPU's drawIndirect command:
-  // vertexCount, instanceCount, firstVertex, firstInstance.
+  // Four u32 values required by WebGPU's drawIndirect command: vertexCount, instanceCount, firstVertex, firstInstance
   //
-  // Draw six vertices per Gaussian (two triangles per quad).
-  // The instance count is overwritten every frame with the visible-Gaussian count produced by preprocessing.
+  // Draw six vertices per Gaussian (two triangles per quad)
+  // The instance count is overwritten every frame with the visible-Gaussian count produced by preprocessing
   const indirect_draw_buffer = createBuffer(
     device,
     'gaussian indirect draw arguments',

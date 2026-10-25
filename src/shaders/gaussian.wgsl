@@ -1,5 +1,7 @@
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
+    //TODO: information passed from vertex shader to fragment shader
+
 
     // Offset from the Gaussian center in normalized device coordinates
     @location(0) offset: vec2<f32>,
@@ -23,6 +25,8 @@ struct VertexOutput {
 
 
 struct Splat {
+    //TODO: information defined in preprocess compute shader
+
     // Projected Gaussian center in normalized device coordinates
     center: vec2<f32>,
 
@@ -59,6 +63,8 @@ fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32
 ) -> VertexOutput {
+    //TODO: reconstruct 2D quad based on information from splat, pass
+
     var out: VertexOutput;
 
     // Each Gaussian is rendered as two triangles (six vertices)
