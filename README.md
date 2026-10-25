@@ -107,6 +107,8 @@ The compressed representation reduces the intermediate splat stride by 33.3%. Bo
 
 The f16 pipeline is available only when the GPU supports `shader-f16`; otherwise, the original f32 implementation remains available.
 
+The viewer starts in the f32 baseline mode. The f16 path is opt-in through the precision selector, which is only offered when the device exposes `shader-f16`.
+
 
 
 #### GPU Performance Benchmarking
@@ -114,6 +116,8 @@ The f16 pipeline is available only when the GPU supports `shader-f16`; otherwise
 I implemented GPU timestamp-based benchmarking to evaluate rendering performance.
 
 Each benchmark configuration uses 30 warm-up frames followed by 100 measured GPU samples. The benchmark reports mean GPU execution time and exports individual samples to CSV files.
+
+For the Gaussian renderer, each sample is the interval between a timestamp written at the beginning of the preprocessing compute pass and a timestamp written at the end of the splat render pass. Every Gaussian timing therefore includes **preprocessing, depth sorting, and rendering** together, not any one stage in isolation.
 
 Four benchmark modes were implemented:
 
@@ -135,6 +139,22 @@ The following experiments investigate the performance characteristics of the imp
 For each configuration, I collected 100 GPU timestamp samples after 30 warm-up frames. The tables report the arithmetic mean GPU execution time.
 
 GPU execution time is distinct from the frame rate displayed by the viewer. The results measure GPU work captured by the benchmark rather than complete end-to-end application latency.
+
+#### Benchmark Records and Consistency
+
+**Precision used in Experiments 1–4: f32.** The CSV files for Experiments 1–4 were all exported on October 24, 2026 between 13:57 and 19:15. The f16 preprocessing shader (`preprocess_f16.wgsl`) was not created until 19:55 that day, and the compressed f16 render shader (`gaussian_f16.wgsl`) until 22:27, so the f16 pipeline did not exist when those experiments were run. Only Experiment 5 compares f16 against f32.
+
+**The same configuration appears with different times in different experiments.** The Bonsai Gaussian renderer at 256 threads with viewport-overlap culling enabled is reported three times:
+
+| Experiment | Reported Time | CSV Exported (Oct 24, 2026) |
+|---|---:|---|
+| 2. Workgroup size (256 threads) | 1.922 ms | 13:57 |
+| 3. Frustum culling (ON) | 2.252 ms | 15:42 |
+| 1. Renderer comparison (Gaussian) | 1.834 ms | 18:08 |
+
+These are three separate benchmark sessions recorded hours apart, not repeated trials under controlled conditions. The preprocessing shader source was also modified between the first and second sessions, so the code was not necessarily identical across them. The camera view used in each session was not recorded, and the cause of the roughly 23% spread could not be verified. **Numbers should only be compared within a single experiment**, where all configurations were measured back-to-back in the same session. Comparisons across experiments are not meaningful.
+
+Similarly, the Bicycle row in Experiment 1 and the 100% row in Experiment 4 are the same measurement (exported together at 19:15).
 
 
 
@@ -198,17 +218,17 @@ Three workgroup sizes were evaluated: 64, 128, and 256 threads.
 
 ![Workgroup size performance](images/09_workgroup_performance.png)
 
-For Bonsai, increasing the workgroup size from 64 to 256 threads slightly reduced GPU execution time, from 1.956 ms to 1.922 ms.
+For Bonsai, increasing the workgroup size from 64 to 256 threads slightly reduced GPU execution time, from 1.956 ms to 1.922 ms (about 1.7%).
 
-For Bicycle, the 64-thread configuration was slightly faster than the 128-thread and 256-thread configurations.
+For Bicycle, the 64-thread configuration was the fastest: 7.662 ms, compared with 7.841 ms at 256 threads (about 2.3% slower at 256).
 
-These results show that larger workgroups do not necessarily improve GPU performance.
+Neither scene shows a consistent trend, and the spread is small. There are three reasons to be cautious about reading much into it:
 
-Larger workgroups can reduce the number of dispatched workgroups and potentially improve scheduling efficiency. However, workgroup size also affects resource allocation, occupancy, and the scheduling of compute workloads.
+- **Only part of the timed work depends on workgroup size.** The workgroup size only changes the preprocessing dispatch. Depth sorting and splat rendering, which are also inside the timed interval, run the same way regardless. Any change in preprocessing cost is therefore diluted by the stages that did not change.
+- **The differences are similar in size to run-to-run variation.** Each configuration was measured once (100 samples). In Experiment 5, three repeated f32 runs of the same Bicycle configuration ranged from 7.657 ms to 7.898 ms, a spread of about 3%. The workgroup-size differences here are smaller than that.
+- **Preprocessing is one thread per Gaussian with no shared memory or barriers.** Because of this, workgroup size mostly changes how threads are grouped for scheduling, not the amount of work. Larger workgroups mean fewer workgroups to dispatch. Smaller ones give the scheduler finer-grained units to distribute. Neither effect is expected to be large for this kernel.
 
-The optimal configuration therefore depends on the scene and GPU architecture.
-
-The differences measured in this experiment were relatively small, so the results do not establish a universally optimal workgroup size.
+These results do not establish an optimal workgroup size for this GPU. They are consistent with workgroup size having little effect on total frame GPU time for this pipeline.
 
 
 
@@ -230,13 +250,17 @@ For Bonsai, enabling viewport-overlap culling did not improve performance. The c
 
 For Bicycle, enabling culling reduced GPU execution time by approximately 1.9%.
 
-Frustum culling can improve performance by rejecting Gaussians that do not contribute to the visible scene, potentially reducing subsequent sorting and rendering work.
+**What the toggle changes.** The toggle only controls the viewport-overlap test, which checks whether a Gaussian's three-sigma footprint overlaps the screen. Behind-camera, near/far depth-range, and invalid-covariance rejection stay active in both configurations. With culling OFF, a Gaussian that is in front of the camera but entirely off-screen is still:
 
-However, culling itself requires additional computation. If relatively few Gaussians are rejected, the cost of checking visibility may offset the savings.
+1. given a spherical-harmonics color evaluation and written to the splat buffer during preprocessing,
+2. appended to the sort list and sorted by depth, and
+3. drawn as an instanced quad, running the vertex shader for its six vertices.
 
-The results suggest that viewport-overlap culling provides a modest benefit for Bicycle but not for Bonsai under the tested conditions.
+With culling ON, these Gaussians are dropped before step 1's color evaluation, so they cost nothing in sorting or rendering.
 
-The culling toggle used in this experiment controls viewport-overlap rejection rather than disabling every visibility check in the preprocessing pipeline.
+**Culling savings vs. hardware clipping.** Even with culling OFF, off-screen quads produce essentially no fragments, because the GPU's fixed-function clipping and rasterization discard geometry outside the viewport. Fragment shading and alpha blending, usually the most expensive part of splatting, are therefore *not* where culling saves time. The actual savings are limited to SH color evaluation, sorting work, and per-instance vertex processing for off-screen Gaussians. Against that, every Gaussian pays for the overlap test. This explains why the measured effect is small in both directions.
+
+**Why the scenes may differ.** How much culling helps depends on how many Gaussians in front of the camera are off-screen, which depends on the scene and camera view. A plausible explanation is that the tested Bicycle view had more off-screen Gaussians than the Bonsai view. However, I did not record visible-Gaussian counts for either configuration, so this cannot be confirmed from these measurements. The Bonsai difference (0.011 ms) is also well within the run-to-run variation discussed above. It should be read as "no measurable effect," not as culling making Bonsai slower.
 
 
 

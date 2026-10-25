@@ -71,8 +71,6 @@ struct Gaussian {
 };
 
 struct Splat {
-    //TODO: store information for 2D splat rendering
-
     // Projected Gaussian center in normalized device coordinates
     center: vec2<f32>,
 
@@ -89,8 +87,6 @@ struct Splat {
     color: vec3<f32>,
 
 };
-
-//TODO: bind your data here
 
 
 // Spherical harmonics coefficients packed as half-precision RGB values
@@ -115,7 +111,7 @@ var<uniform> camera: CameraUniforms;
 
 
 
-// Projected Gaussian centers written by the compute shader
+// Projected 2D splats (center, conic, opacity, color) written by the compute shader
 @group(0) @binding(2)
 var<storage, read_write> splats: array<Splat>;
 @group(2) @binding(0)
@@ -129,10 +125,6 @@ var<storage, read_write> sort_dispatch: DispatchIndirect;
 
 /// reads the ith sh coef from the storage buffer
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
-    //TODO: access your binded sh_coeff, see load.ts for how it is stored
-
-
-
     // Each Gaussian contains 16 RGB coefficients, or 48 f16 values
     // Coefficients are stored in RGB-interleaved order
     let base = splat_idx * 48u + c_idx * 3u;
@@ -206,7 +198,6 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
-    //TODO: set up pipeline as described in instruction
 
 
     // Prevent invocations in the final workgroup from reading beyond the allocated Gaussian input buffer
@@ -447,8 +438,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     // Compute the inverse covariance coefficients (the conic)
-    // For invalid covariance matrices, use zero as a temporary fallback
-    // Final visibility handling will be implemented later
+    // Invalid covariance matrices keep a zero conic; such Gaussians are rejected by valid_projection below
     var conic = vec3<f32>(0.0, 0.0, 0.0);
 
     if (valid_covariance) {
@@ -529,9 +519,9 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
 
-    // Diagnostic extent-aware visibility filtering
-    // The three-sigma projected radius allows Gaussians whose centers lie outside the viewport to remain visible if their footprints overlap
-    // Visible-instance compaction will be implemented later
+    // Validity checks that always apply, independent of the frustum-culling toggle:
+    // the center must be in front of the camera, within the near/far depth range, and have an invertible covariance
+    // When enableFrustumCulling is 1, gaussian_in_frustum additionally requires the three-sigma footprint to overlap the viewport
     let valid_projection =
     clip_pos.w > 0.00001 &&
     clip_pos.z >= 0.0 &&
@@ -597,8 +587,8 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
     } else {
-        // Move centers outside the frustum beyond the visible viewport
-        // We still draw every instance until visible-instance compaction is added
+        // Rejected Gaussians are not appended to the sort list, so they are not drawn
+        // Clear their splat entry so the buffer never holds stale data
         splats[idx].center = vec2<f32>(10.0, 10.0);
 
 

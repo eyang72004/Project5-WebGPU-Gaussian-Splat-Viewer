@@ -52,7 +52,8 @@ export default function get_renderer(
 
   let frustumCullingEnabled = true;
 
-  let useF16Preprocessing = device.features.has('shader-f16');
+  // Default to the f32 baseline; the f16 path is opt-in through setF16Preprocessing
+  let useF16Preprocessing = false;
   
   // ===============================================
   //            Initialize GPU Buffers
@@ -135,37 +136,6 @@ export default function get_renderer(
 
 
 
-  // // Create one reference pipeline to obtain the bind-group layouts
-  // const reference_pipeline = device.createComputePipeline({
-  //   label: 'preprocess-reference-256',
-  //   layout: 'auto',
-  //   compute: {
-  //     module: preprocess_module,
-  //     entryPoint: 'preprocess',
-  //     constants: {
-  //       workgroupSize: 256,
-  //       sortKeyPerThread: c_histogram_block_rows,
-  //       shDegree: pc.sh_deg,
-  //     },
-  //   },
-  // });
-
-
-
-
-  // // Reuse these exact layouts for every preprocessing pipeline
-  // const shared_pipeline_layout = device.createPipelineLayout({
-  //   label: 'shared gaussian preprocessing layout',
-  //   bindGroupLayouts: [
-  //     reference_pipeline.getBindGroupLayout(0),
-  //     reference_pipeline.getBindGroupLayout(1),
-  //     reference_pipeline.getBindGroupLayout(2),
-  //   ],
-  // });
-
-
-
-
   const pipelineKey = (size: number, culling: boolean): string =>
   `${size}-${culling ? 'on' : 'off'}`;
 
@@ -217,13 +187,9 @@ export default function get_renderer(
 
   let activePreprocessWorkgroupSize: PreprocessWorkgroupSize = 256;
 
-  // const preprocess_pipeline = preprocess_pipelines.get(256)!;
 
-
-
-
-  // Bind packed Gaussian attributes, camera matrices, projected splats, and spherical harmonics coefficients
-  // These bindings correspond to @group(0) @binding(0..3) in preprocess.wgsl
+  // Bind packed Gaussian attributes, camera matrices, projected splats, spherical harmonics coefficients, and render settings
+  // These bindings correspond to @group(0) @binding(0..4) in preprocess.wgsl
   const preprocess_bind_groups = new Map<string, GPUBindGroup>();
   const sort_bind_groups = new Map<string, GPUBindGroup>();
 
@@ -292,51 +258,6 @@ export default function get_renderer(
       }
     }
   }
-  // const sort_bind_groups = new Map<number, GPUBindGroup>();
-
-  // for (const size of PREPROCESS_WG_SIZES) {
-  //   const pipeline = preprocess_pipelines.get(size)!;
-
-  //   const preprocessBindGroup = device.createBindGroup({
-  //     label: `gaussian preprocessing resources ${size}`,
-  //     layout: pipeline.getBindGroupLayout(0),
-  //     entries: [
-  //       { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
-  //       { binding: 1, resource: { buffer: camera_buffer } },
-  //       { binding: 2, resource: { buffer: splat_buffer } },
-  //       { binding: 3, resource: { buffer: pc.sh_buffer } },
-  //       { binding: 4, resource: { buffer: render_settings_buffer } },
-  //     ],
-  //   });
-
-  //   const sortBindGroup = device.createBindGroup({
-  //     label: `gaussian sort resources ${size}`,
-  //     layout: pipeline.getBindGroupLayout(2),
-  //     entries: [
-  //       { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
-  //       { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
-  //       { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-  //       { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
-  //     ],
-  //   });
-
-    // preprocess_bind_groups.set(size, preprocessBindGroup);
-    // sort_bind_groups.set(size, sortBindGroup);
-  // }
-
-
-
-
-  // const sort_bind_group = device.createBindGroup({
-  //   label: 'sort',
-  //   layout: preprocess_pipeline.getBindGroupLayout(2),
-  //   entries: [
-  //     { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
-  //     { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
-  //     { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-  //     { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
-  //   ],
-  // });
 
 
   // ===============================================
@@ -346,8 +267,8 @@ export default function get_renderer(
   // Four u32 values required by WebGPU's drawIndirect command:
   // vertexCount, instanceCount, firstVertex, firstInstance.
   //
-  // Initially, draw six vertices per Gaussian (two triangles per quad).
-  // Preprocessing will eventually determine the visible instance count.
+  // Draw six vertices per Gaussian (two triangles per quad).
+  // The instance count is overwritten every frame with the visible-Gaussian count produced by preprocessing.
   const indirect_draw_buffer = createBuffer(
     device,
     'gaussian indirect draw arguments',
@@ -439,8 +360,8 @@ const render_f16_pipeline = render_f16_shader
 
 
 
-  // Bind the projected Gaussian centers to the vertex shader
-  // This corresponds to @group(0) @binding(0) in gaussian.wgsl
+  // Bind the projected splats and depth-sorted indices to the vertex shader
+  // These correspond to @group(0) @binding(0..1) in gaussian.wgsl
   const render_bind_group = device.createBindGroup({
     label: 'gaussian rendering resources',
     layout: render_pipeline.getBindGroupLayout(0),
@@ -484,7 +405,7 @@ const render_f16_pipeline = render_f16_shader
 
 
   // Dispatch one preprocessing invocation per Gaussian
-  // Preprocessing uses PREPROCESS_WG_SIZE threads per workgroup, independently of the radix sort configuration
+  // Preprocessing uses activePreprocessWorkgroupSize threads per workgroup, independently of the radix sort configuration
   // The shader performs a bounds check for excess invocations
 
   let loggedPreprocessMode = false;
@@ -512,7 +433,7 @@ const render_f16_pipeline = render_f16_shader
 
 
 
-    // Temporarily activate f16 preprocessing when supported
+    // Select the f32 or f16 pipeline variant for this frame
     const useF16 = useF16Preprocessing;
 
 
@@ -561,7 +482,7 @@ const render_f16_pipeline = render_f16_shader
   };
 
   // Record a render pass that draws Gaussian quads indirectly
-  // The instance count currently equals the full point count
+  // The instance count is the visible-Gaussian count copied from preprocessing
   const render = (
     encoder: GPUCommandEncoder,
     texture_view: GPUTextureView

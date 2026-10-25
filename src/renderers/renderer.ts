@@ -52,7 +52,7 @@ export default async function init(
     gaussian_multiplier: 1,
     gaussian_fraction: 1.0,
     renderer: 'pointcloud',
-    preprocess_precision: device.features.has('shader-f16') ? 'f16' : 'f32',
+    preprocess_precision: 'f32',
     ply_file: '',
     cam_file: '',
   };
@@ -90,10 +90,10 @@ export default async function init(
   {
     pane.addInput(params, 'preprocess_precision', {
       label: 'precision',
-      options: {
-        'f32 (baseline)': 'f32',
-        'f16 (experimental)': 'f16',
-      },
+      // Only offer f16 when the device supports it, so the GUI never shows a mode the GPU is not running
+      options: device.features.has('shader-f16')
+        ? { 'f32 (baseline)': 'f32', 'f16 (experimental)': 'f16' }
+        : { 'f32 (baseline)': 'f32' },
     }).on('change', (e) => {
       gaussian_renderer?.setF16Preprocessing(e.value === 'f16');
     });
@@ -119,6 +119,8 @@ export default async function init(
         pointcloud_renderer = get_renderer_pointcloud(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer = get_renderer_gaussian(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer.setF16Preprocessing(params.preprocess_precision === 'f16');
+        // A new renderer starts with gaussian_scaling = 1.0; re-apply the GUI value
+        gaussian_renderer.setGaussianMultiplier(params.gaussian_multiplier);
         renderers = {
           pointcloud: pointcloud_renderer,
           gaussian: gaussian_renderer,
@@ -154,7 +156,6 @@ export default async function init(
       'gaussian_multiplier',
       {min: 0, max: 1.5}
     ).on('change', (e) => {
-      //TODO: Bind constants to the gaussian renderer.
       gaussian_renderer?.setGaussianMultiplier(e.value);
     });
   }
