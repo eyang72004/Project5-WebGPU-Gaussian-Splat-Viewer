@@ -148,21 +148,13 @@ For each configuration, I collected 100 GPU timestamp samples after 30 warm-up f
 
 GPU execution time is distinct from the frame rate displayed by the viewer. The results measure GPU work captured by the benchmark rather than complete end-to-end application latency.
 
-#### Benchmark Records and Consistency
+#### Benchmark Consistency
 
-**Precision used in Experiments 1–4: f32.** The CSV files for Experiments 1–4 were all exported on October 24, 2026 between 13:57 and 19:15. The f16 preprocessing shader (`preprocess_f16.wgsl`) was not created until 19:55 that day, and the compressed f16 render shader (`gaussian_f16.wgsl`) until 22:27, so the f16 pipeline did not exist when those experiments were run. Only Experiment 5 compares f16 against f32.
+Experiments 1–4 used the original f32 pipeline, while Experiment 5 compares f32 against the final f16 implementation.
 
-**The same configuration appears with different times in different experiments.** The Bonsai Gaussian renderer at 256 threads with viewport-overlap culling enabled is reported three times:
+Some configurations appear in multiple experiments with different GPU times. For example, Bonsai at 256 threads with culling enabled measured 1.922 ms in the workgroup experiment, 2.252 ms in the culling experiment, and 1.834 ms in the renderer comparison. These measurements came from separate sessions, with implementation changes between some runs and potentially different camera views.
 
-| Experiment | Reported Time | CSV Exported (Oct 24, 2026) |
-|---|---:|---|
-| 2. Workgroup size (256 threads) | 1.922 ms | 13:57 |
-| 3. Frustum culling (ON) | 2.252 ms | 15:42 |
-| 1. Renderer comparison (Gaussian) | 1.834 ms | 18:08 |
-
-These are three separate benchmark sessions recorded hours apart, not repeated trials under controlled conditions. The preprocessing shader source was also modified between the first and second sessions, so the code was not necessarily identical across them. The camera view used in each session was not recorded, and the cause of the roughly 23% spread could not be verified. **Numbers should only be compared within a single experiment**, where all configurations were measured back-to-back in the same session. Comparisons across experiments are not meaningful.
-
-Similarly, the Bicycle row in Experiment 1 and the 100% row in Experiment 4 are the same measurement (exported together at 19:15).
+For this reason, I compare configurations within each experiment rather than directly comparing GPU times across separate sessions. The Bicycle measurement in Experiment 1 is also reused as the 100% configuration in Experiment 4.
 
 
 
@@ -230,13 +222,11 @@ For Bonsai, increasing the workgroup size from 64 to 256 threads slightly reduce
 
 For Bicycle, the 64-thread configuration was the fastest: 7.662 ms, compared with 7.841 ms at 256 threads (about 2.3% slower at 256).
 
-Neither scene shows a consistent trend, and the spread is small. There are three reasons to be cautious about reading much into it:
+Neither scene shows a consistent trend, and the measured differences are relatively small. The preprocessing workgroup size affects only the preprocessing dispatch, while depth sorting and rendering remain unchanged. Since the timing includes all three stages, improvements in preprocessing may have a limited effect on total GPU execution time.
 
-- **Only part of the timed work depends on workgroup size.** The workgroup size only changes the preprocessing dispatch. Depth sorting and splat rendering, which are also inside the timed interval, run the same way regardless. Any change in preprocessing cost is therefore diluted by the stages that did not change.
-- **The differences are similar in size to run-to-run variation.** Each configuration was measured once (100 samples). In Experiment 5, three repeated f32 runs of the same Bicycle configuration ranged from 7.657 ms to 7.898 ms, a spread of about 3%. The workgroup-size differences here are smaller than that.
-- **Preprocessing is one thread per Gaussian with no shared memory or barriers.** Because of this, workgroup size mostly changes how threads are grouped for scheduling, not the amount of work. Larger workgroups mean fewer workgroups to dispatch. Smaller ones give the scheduler finer-grained units to distribute. Neither effect is expected to be large for this kernel.
+The preprocessing kernel also processes Gaussians independently, without shared memory or workgroup barriers. Changing the workgroup size primarily affects GPU scheduling rather than the amount of computation.
 
-These results do not establish an optimal workgroup size for this GPU. They are consistent with workgroup size having little effect on total frame GPU time for this pipeline.
+Each configuration was measured once using 100 GPU samples. For comparison, the repeated f32 Bicycle measurements in Experiment 5 varied by approximately 2.3%, similar to the differences observed here. These results therefore do not establish a single optimal workgroup size for this GPU.
 
 
 
@@ -258,17 +248,13 @@ For Bonsai, enabling viewport-overlap culling did not improve performance. The c
 
 For Bicycle, enabling culling reduced GPU execution time by approximately 1.9%.
 
-**What the toggle changes.** The toggle only controls the viewport-overlap test, which checks whether a Gaussian's three-sigma footprint overlaps the screen. Behind-camera, near/far depth-range, and invalid-covariance rejection stay active in both configurations. With culling OFF, a Gaussian that is in front of the camera but entirely off-screen is still:
+The culling toggle controls only the viewport-overlap test, which checks whether a Gaussian's projected three-sigma footprint intersects the screen. Other visibility and validity checks, including behind-camera, depth-range, and invalid-covariance rejection, remain enabled in both configurations.
 
-1. given a spherical-harmonics color evaluation and written to the splat buffer during preprocessing,
-2. appended to the sort list and sorted by depth, and
-3. drawn as an instanced quad, running the vertex shader for its six vertices.
+With culling disabled, Gaussians that are in front of the camera but entirely outside the viewport may still undergo spherical-harmonics color evaluation, depth sorting, and instanced quad rendering. Enabling viewport-overlap culling rejects these Gaussians earlier, reducing preprocessing, sorting, and vertex-processing work.
 
-With culling ON, these Gaussians are dropped before step 1's color evaluation, so they cost nothing in sorting or rendering.
+However, off-screen quads produce essentially no fragments because they are clipped or discarded during rasterization. Therefore, viewport-overlap culling does not significantly reduce fragment shading for fully off-screen Gaussians. Its performance benefit must also outweigh the additional overlap test performed during preprocessing.
 
-**Culling savings vs. hardware clipping.** Even with culling OFF, off-screen quads produce essentially no fragments, because the GPU's fixed-function clipping and rasterization discard geometry outside the viewport. Fragment shading and alpha blending, usually the most expensive part of splatting, are therefore *not* where culling saves time. The actual savings are limited to SH color evaluation, sorting work, and per-instance vertex processing for off-screen Gaussians. Against that, every Gaussian pays for the overlap test. This explains why the measured effect is small in both directions.
-
-**Why the scenes may differ.** How much culling helps depends on how many Gaussians in front of the camera are off-screen, which depends on the scene and camera view. A plausible explanation is that the tested Bicycle view had more off-screen Gaussians than the Bonsai view. However, I did not record visible-Gaussian counts for either configuration, so this cannot be confirmed from these measurements. The Bonsai difference (0.011 ms) is also well within the run-to-run variation discussed above. It should be read as "no measurable effect," not as culling making Bonsai slower.
+The results suggest that the effectiveness of viewport-overlap culling depends on the scene and camera view. For Bicycle, enabling culling reduced GPU execution time by approximately 1.9%, while Bonsai showed a negligible difference of 0.011 ms. Since I did not record visible-Gaussian counts, I cannot determine whether the Bicycle view contained more off-screen Gaussians. These measurements indicate a small, scene-dependent benefit rather than a consistent performance improvement.
 
 
 
@@ -307,32 +293,27 @@ Additionally, the reduced-size datasets were created by selecting the first N Ga
 
 #### 5. Half-Precision Gaussian Preprocessing (Extra Credit)
 
-The fifth experiment evaluates whether half-precision preprocessing and compressed intermediate splat storage improve GPU performance relative to the original f32 pipeline.
+This experiment compares the original f32 Gaussian pipeline against the final f16 implementation, which uses half-precision arithmetic for spherical-harmonics color evaluation, opacity, and scale calculations, along with compressed intermediate splat storage.
 
-I used the Bicycle scene with all 1,063,091 Gaussians, a preprocessing workgroup size of 256 threads, and viewport-overlap frustum culling enabled. Both precision modes used the same scene and camera configuration.
-
-Each benchmark run consisted of 30 warm-up frames followed by 100 GPU timestamp samples per precision mode. I repeated the experiment three times, collecting 300 samples per mode.
+I tested the Bicycle scene with all 1,063,091 Gaussians, 256 preprocessing threads per workgroup, and viewport-overlap culling enabled. Each run measured f32 followed by f16, with 30 warm-up frames and 100 GPU timestamp samples per mode. I repeated the comparison three times for 300 samples per precision mode.
 
 | Run | f32 Mean GPU Time | f16 Mean GPU Time | GPU Time Reduction |
 |---|---:|---:|---:|
-| 1 | 7.657 ms | 7.569 ms | 1.15% |
-| 2 | 7.699 ms | 7.569 ms | 1.68% |
-| 3 | 7.898 ms | 7.782 ms | 1.47% |
-| **Overall** | **7.751 ms** | **7.640 ms** | **1.43%** |
+| 1 | 7.068 ms | 7.054 ms | 0.20% |
+| 2 | 7.230 ms | 7.031 ms | 2.75% |
+| 3 | 7.171 ms | 7.069 ms | 1.43% |
+| **Overall** | **7.156 ms** | **7.051 ms** | **1.47%** |
 
-![f32 vs. f16 Gaussian pipeline performance](images/12_f16_vs_f32_performance.png)
 
-Across the three runs, the compressed f16 implementation reduced mean GPU execution time from approximately 7.751 ms to 7.640 ms, corresponding to a 1.43% reduction in measured GPU time.
+![f32 vs. f16 Gaussian rendering performance](images/12_f16_vs_f32_performance.png)
 
-The f16 implementation was faster in all three runs, although the improvement was relatively small. The results suggest that half-precision preprocessing and compressed splat storage can provide a modest performance benefit for the tested scene and GPU.
+Across the three runs, f16 reduced average GPU execution time from 7.156 ms to 7.051 ms, an improvement of approximately 1.47%. It was faster in all three runs, although the improvement varied between runs.
 
-The optimization reduces the intermediate splat representation from 48 bytes to 32 bytes per Gaussian, a 33.3% reduction in per-splat storage. However, both representations are allocated to support runtime precision switching, and the measured timing includes preprocessing, sorting, and rendering rather than preprocessing alone.
+The compressed intermediate splat representation uses 32 bytes per Gaussian instead of 48 bytes, reducing its stride by 33.3%. Both buffer formats are still allocated for runtime switching, so this is not a 33.3% reduction in total GPU memory usage.
 
-Therefore, the results do not establish that preprocessing itself is 1.43% faster or that total GPU memory usage is reduced by 33.3%. Additional experiments would be required to isolate the individual contributions of half-precision arithmetic and compressed memory accesses.
+Since the benchmark measures preprocessing, depth sorting, and rendering together, the results reflect the complete Gaussian pipeline rather than the preprocessing shader alone. The modest improvement also suggests that reducing intermediate storage and using f16 arithmetic does not necessarily produce an equally large reduction in total rendering time.
 
-The results also reflect three sequential f32-then-f16 benchmark runs on one GPU. Although the improvement was consistent across these runs, GPU clock variation, temperature, and benchmark order may influence the measured differences.
-
-These measurements were collected before spherical-harmonics color evaluation was moved to f16 and before the f16 `exp()` range clamps were added. In that earlier version, only the opacity sigmoid and scale exponentiation used f16 arithmetic. The current f16 shader has not been re-benchmarked, so the table above should not be read as a measurement of it.
+These measurements were collected using the final f16 shader, including native f16 spherical-harmonics evaluation and the opacity and scale range safeguards.
 
 
 
