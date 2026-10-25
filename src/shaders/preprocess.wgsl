@@ -24,6 +24,9 @@ override sortKeyPerThread: u32;
 // Maximum spherical harmonics degree available in the loaded Gaussian data
 override shDegree: u32;
 
+// Benchmark toggle: 1 enables frustum culling, 0 disables it
+override enableFrustumCulling: u32 = 1u;
+
 struct DispatchIndirect {
     dispatch_x: atomic<u32>,
     dispatch_y: u32,
@@ -529,7 +532,13 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Diagnostic extent-aware visibility filtering
     // The three-sigma projected radius allows Gaussians whose centers lie outside the viewport to remain visible if their footprints overlap
     // Visible-instance compaction will be implemented later
-    if (gaussian_in_frustum) {
+    let valid_projection =
+    clip_pos.w > 0.00001 &&
+    clip_pos.z >= 0.0 &&
+    clip_pos.z <= clip_pos.w &&
+    valid_covariance;
+
+    if (valid_projection && (enableFrustumCulling == 0u || gaussian_in_frustum)) {
 
 
         // Encode positive camera-space depth as an unsigned sorting key
@@ -555,7 +564,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
 
         // Increase the sorting dispatch count once per block of visible Gaussians
-        let keys_per_dispatch = workgroupSize * sortKeyPerThread;
+        let keys_per_dispatch = 256u * sortKeyPerThread;
 
         if (sort_idx % keys_per_dispatch == 0u) {
             atomicAdd(&sort_dispatch.dispatch_x, 1u);

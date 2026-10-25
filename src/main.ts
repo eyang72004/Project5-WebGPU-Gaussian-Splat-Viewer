@@ -19,10 +19,18 @@ import { assert } from './utils/util';
   }
   
   
+  const requiredFeatures: GPUFeatureName[] = [];
+
+  if (adapter.features.has('timestamp-query')) {
+    requiredFeatures.push('timestamp-query');
+  }
+
+  if (adapter.features.has('shader-f16')) {
+    requiredFeatures.push('shader-f16');
+  }
+
   const device = await adapter.requestDevice({
-    requiredFeatures: adapter.features.has('timestamp-query')
-      ? ['timestamp-query']
-      : [],
+    requiredFeatures,
     requiredLimits: {
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -32,6 +40,11 @@ import { assert } from './utils/util';
   console.log(
     'GPU timestamp queries enabled:',
     device.features.has('timestamp-query')
+  );
+
+  console.log(
+    'GPU shader-f16 enabled:',
+    device.features.has('shader-f16')
   );
 
   const canvas = document.querySelector<HTMLCanvasElement>('#webgpu-canvas');

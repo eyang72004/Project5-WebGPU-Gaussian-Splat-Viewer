@@ -1,11 +1,26 @@
 import { PointCloud } from '../utils/load';
 import preprocessWGSL from '../shaders/preprocess.wgsl';
+import preprocessF16WGSL from '../shaders/preprocess_f16.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import { get_sorter,c_histogram_block_rows,C } from '../sort/sort';
 import { Renderer } from './renderer';
+import { GPUTimer } from '../utils/gpu-timer';
+import renderF16WGSL from '../shaders/gaussian_f16.wgsl';
+const PREPROCESS_WG_SIZES = [64, 128, 256] as const;
+type PreprocessWorkgroupSize = 64 | 128 | 256;
 
 export interface GaussianRenderer extends Renderer {
   setGaussianMultiplier: (value: number) => void;
+  setBenchmarkCapture: (enabled: boolean) => void;
+  resolveBenchmark: (encoder: GPUCommandEncoder) => void;
+  readBenchmarkMs: () => Promise<number>;
+  readonly preprocessWorkgroupSize: number;
+  setPreprocessWorkgroupSize: (size: number) => void;
+  readonly frustumCullingEnabled: boolean;
+  setFrustumCulling: (enabled: boolean) => void;
+  readonly f16PreprocessingEnabled: boolean;
+  setF16Preprocessing: (enabled: boolean) => void;
+  readonly f16PreprocessingSupported: boolean;
 }
 
 // Utility to create GPU buffers
@@ -29,6 +44,15 @@ export default function get_renderer(
 ): GaussianRenderer {
 
   const sorter = get_sorter(pc.num_points, device);
+
+  const gpuTimer = device.features.has('timestamp-query') ? new GPUTimer(device) : undefined;
+
+  let benchmarkCapture = false;
+
+
+  let frustumCullingEnabled = true;
+
+  let useF16Preprocessing = device.features.has('shader-f16');
   
   // ===============================================
   //            Initialize GPU Buffers
@@ -41,6 +65,13 @@ export default function get_renderer(
     device,
     'projected Gaussian splats',
     pc.num_points * 48,
+    GPUBufferUsage.STORAGE
+  );
+
+  const splat_f16_buffer = createBuffer(
+    device,
+    'compressed projected Gaussian splats',
+    pc.num_points * 32,
     GPUBufferUsage.STORAGE
   );
 
@@ -67,65 +98,245 @@ export default function get_renderer(
   // ===============================================
   //    Create Compute Pipeline and Bind Groups
   // ===============================================
-  const preprocess_pipeline = device.createComputePipeline({
-    label: 'preprocess',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: preprocessWGSL }),
-      entryPoint: 'preprocess',
-      constants: {
-        workgroupSize: C.histogram_wg_size,
-        sortKeyPerThread: c_histogram_block_rows,
-        shDegree: pc.sh_deg,
-      },
-    },
+  const preprocess_pipelines = new Map<string, GPUComputePipeline>();
+
+  const preprocess_module = device.createShaderModule({
+    label: 'gaussian preprocessing shader',
+    code: preprocessWGSL,
   });
+
+
+  const supportsShaderF16 = device.features.has('shader-f16');
+
+  console.log('Gaussian preprocessing f16 available:', supportsShaderF16);
+
+  const preprocess_f16_module = supportsShaderF16
+  ? device.createShaderModule({
+      label: 'gaussian f16 preprocessing shader',
+      code: preprocessF16WGSL,
+    })
+  : undefined;
+
+
+
+  if (preprocess_f16_module) {
+    void preprocess_f16_module.getCompilationInfo().then((info) => {
+      for (const message of info.messages) {
+        console.log(
+          `[f16 WGSL ${message.type}] line ${message.lineNum}: ${message.message}`
+        );
+      }
+
+      if (info.messages.length === 0) {
+        console.log('f16 WGSL compilation: no diagnostics');
+      }
+    });
+  }
+
+
+
+  // // Create one reference pipeline to obtain the bind-group layouts
+  // const reference_pipeline = device.createComputePipeline({
+  //   label: 'preprocess-reference-256',
+  //   layout: 'auto',
+  //   compute: {
+  //     module: preprocess_module,
+  //     entryPoint: 'preprocess',
+  //     constants: {
+  //       workgroupSize: 256,
+  //       sortKeyPerThread: c_histogram_block_rows,
+  //       shDegree: pc.sh_deg,
+  //     },
+  //   },
+  // });
+
+
+
+
+  // // Reuse these exact layouts for every preprocessing pipeline
+  // const shared_pipeline_layout = device.createPipelineLayout({
+  //   label: 'shared gaussian preprocessing layout',
+  //   bindGroupLayouts: [
+  //     reference_pipeline.getBindGroupLayout(0),
+  //     reference_pipeline.getBindGroupLayout(1),
+  //     reference_pipeline.getBindGroupLayout(2),
+  //   ],
+  // });
+
+
+
+
+  const pipelineKey = (size: number, culling: boolean): string =>
+  `${size}-${culling ? 'on' : 'off'}`;
+
+  for (const size of PREPROCESS_WG_SIZES) {
+    for (const culling of [true, false]) {
+      const pipeline = device.createComputePipeline({
+        label: `preprocess-${size}-culling-${culling ? 'on' : 'off'}`,
+        layout: 'auto',
+        compute: {
+          module: preprocess_module,
+          entryPoint: 'preprocess',
+          constants: {
+            workgroupSize: size,
+            sortKeyPerThread: c_histogram_block_rows,
+            shDegree: pc.sh_deg,
+            enableFrustumCulling: culling ? 1 : 0,
+          },
+        },
+      });
+
+      preprocess_pipelines.set(pipelineKey(size, culling), pipeline);
+
+
+      if (preprocess_f16_module) {
+        const f16Pipeline = device.createComputePipeline({
+          label: `preprocess-f16-${size}-culling-${culling ? 'on' : 'off'}`,
+          layout: 'auto',
+          compute: {
+            module: preprocess_f16_module,
+            entryPoint: 'preprocess',
+            constants: {
+              workgroupSize: size,
+              sortKeyPerThread: c_histogram_block_rows,
+              shDegree: pc.sh_deg,
+              enableFrustumCulling: culling ? 1 : 0,
+            },
+          },
+        });
+
+        preprocess_pipelines.set(
+          `${pipelineKey(size, culling)}-f16`,
+          f16Pipeline
+        );
+      }
+    }
+  }
+
+
+
+  let activePreprocessWorkgroupSize: PreprocessWorkgroupSize = 256;
+
+  // const preprocess_pipeline = preprocess_pipelines.get(256)!;
 
 
 
 
   // Bind packed Gaussian attributes, camera matrices, projected splats, and spherical harmonics coefficients
   // These bindings correspond to @group(0) @binding(0..3) in preprocess.wgsl
-  const preprocess_bind_group = device.createBindGroup({
-    label: 'gaussian preprocessing resources',
-    layout: preprocess_pipeline.getBindGroupLayout(0),
-    entries: [
-      {
-        binding: 0,
-        resource: { buffer: pc.gaussian_3d_buffer },
-      },
-      {
-        binding: 1,
-        resource: { buffer: camera_buffer },
-      },
-      {
-        binding: 2,
-        resource: { buffer: splat_buffer },
-      },
-      {
-        binding: 3,
-        resource: { buffer: pc.sh_buffer },
-      },
-      {
-        binding: 4,
-        resource: { buffer: render_settings_buffer },
-      },
-    ],
-  });
+  const preprocess_bind_groups = new Map<string, GPUBindGroup>();
+  const sort_bind_groups = new Map<string, GPUBindGroup>();
+
+  for (const size of PREPROCESS_WG_SIZES) {
+    for (const culling of [true, false]) {
+      const key = pipelineKey(size, culling);
+      const pipeline = preprocess_pipelines.get(key)!;
+
+      const preprocessBindGroup = device.createBindGroup({
+        label: `gaussian preprocessing resources ${key}`,
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+          { binding: 1, resource: { buffer: camera_buffer } },
+          { binding: 2, resource: { buffer: splat_buffer } },
+          { binding: 3, resource: { buffer: pc.sh_buffer } },
+          { binding: 4, resource: { buffer: render_settings_buffer } },
+        ],
+      });
+
+      const sortBindGroup = device.createBindGroup({
+        label: `gaussian sort resources ${key}`,
+        layout: pipeline.getBindGroupLayout(2),
+        entries: [
+          { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+          { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+          { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+          { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+        ],
+      });
+
+      preprocess_bind_groups.set(key, preprocessBindGroup);
+      sort_bind_groups.set(key, sortBindGroup);
+
+
+
+      if (supportsShaderF16) {
+        const f16Key = `${key}-f16`;
+        const f16Pipeline = preprocess_pipelines.get(f16Key)!;
+
+        const f16PreprocessBindGroup = device.createBindGroup({
+          label: `gaussian f16 preprocessing resources ${f16Key}`,
+          layout: f16Pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+            { binding: 1, resource: { buffer: camera_buffer } },
+            { binding: 2, resource: { buffer: splat_f16_buffer } },
+            { binding: 3, resource: { buffer: pc.sh_buffer } },
+            { binding: 4, resource: { buffer: render_settings_buffer } },
+          ],
+        });
+
+        const f16SortBindGroup = device.createBindGroup({
+          label: `gaussian f16 sort resources ${f16Key}`,
+          layout: f16Pipeline.getBindGroupLayout(2),
+          entries: [
+            { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+            { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+            { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+            { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+          ],
+        });
+
+        preprocess_bind_groups.set(f16Key, f16PreprocessBindGroup);
+        sort_bind_groups.set(f16Key, f16SortBindGroup);
+      }
+    }
+  }
+  // const sort_bind_groups = new Map<number, GPUBindGroup>();
+
+  // for (const size of PREPROCESS_WG_SIZES) {
+  //   const pipeline = preprocess_pipelines.get(size)!;
+
+  //   const preprocessBindGroup = device.createBindGroup({
+  //     label: `gaussian preprocessing resources ${size}`,
+  //     layout: pipeline.getBindGroupLayout(0),
+  //     entries: [
+  //       { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+  //       { binding: 1, resource: { buffer: camera_buffer } },
+  //       { binding: 2, resource: { buffer: splat_buffer } },
+  //       { binding: 3, resource: { buffer: pc.sh_buffer } },
+  //       { binding: 4, resource: { buffer: render_settings_buffer } },
+  //     ],
+  //   });
+
+  //   const sortBindGroup = device.createBindGroup({
+  //     label: `gaussian sort resources ${size}`,
+  //     layout: pipeline.getBindGroupLayout(2),
+  //     entries: [
+  //       { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+  //       { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+  //       { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+  //       { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+  //     ],
+  //   });
+
+    // preprocess_bind_groups.set(size, preprocessBindGroup);
+    // sort_bind_groups.set(size, sortBindGroup);
+  // }
 
 
 
 
-  const sort_bind_group = device.createBindGroup({
-    label: 'sort',
-    layout: preprocess_pipeline.getBindGroupLayout(2),
-    entries: [
-      { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
-      { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
-      { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-      { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
-    ],
-  });
+  // const sort_bind_group = device.createBindGroup({
+  //   label: 'sort',
+  //   layout: preprocess_pipeline.getBindGroupLayout(2),
+  //   entries: [
+  //     { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+  //     { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+  //     { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+  //     { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+  //   ],
+  // });
 
 
   // ===============================================
@@ -182,6 +393,51 @@ export default function get_renderer(
 });
 
 
+// Create a rendering pipeline for compressed 32-byte splats
+const render_f16_shader = supportsShaderF16
+  ? device.createShaderModule({
+      label: 'compressed gaussian render shader',
+      code: renderF16WGSL,
+    })
+  : undefined;
+
+const render_f16_pipeline = render_f16_shader
+  ? device.createRenderPipeline({
+      label: 'compressed gaussian render pipeline',
+      layout: 'auto',
+
+      vertex: {
+        module: render_f16_shader,
+        entryPoint: 'vs_main',
+      },
+
+      fragment: {
+        module: render_f16_shader,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: presentation_format,
+          blend: {
+            color: {
+              srcFactor: 'src-alpha',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+            alpha: {
+              srcFactor: 'one',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+          },
+        }],
+      },
+
+      primitive: {
+        topology: 'triangle-list',
+      },
+    })
+  : undefined;
+
+
 
   // Bind the projected Gaussian centers to the vertex shader
   // This corresponds to @group(0) @binding(0) in gaussian.wgsl
@@ -201,6 +457,25 @@ export default function get_renderer(
       },
     ],
   });
+
+  const render_f16_bind_group = render_f16_pipeline
+  ? device.createBindGroup({
+      label: 'compressed gaussian rendering resources',
+      layout: render_f16_pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: splat_f16_buffer },
+        },
+        {
+          binding: 1,
+          resource: {
+            buffer: sorter.ping_pong[0].sort_indices_buffer,
+          },
+        },
+      ],
+    })
+  : undefined;
     
 
   // ===============================================
@@ -209,10 +484,10 @@ export default function get_renderer(
 
 
   // Dispatch one preprocessing invocation per Gaussian
-  // The workgroup size is 256, matching the specialization constant supplied when creating the preprocessing compute pipeline
+  // Preprocessing uses PREPROCESS_WG_SIZE threads per workgroup, independently of the radix sort configuration
   // The shader performs a bounds check for excess invocations
 
-
+  let loggedPreprocessMode = false;
 
   const preprocess = (encoder: GPUCommandEncoder) => {
     // Reset the visible-Gaussian counter before each preprocessing dispatch
@@ -226,25 +501,45 @@ export default function get_renderer(
     encoder.clearBuffer(sorter.sort_dispatch_indirect_buffer, 0, Uint32Array.BYTES_PER_ELEMENT);
     
     const pass = encoder.beginComputePass({
-      label: 'gaussian preprocessing'
+      label: 'gaussian preprocessing',
+      ...(gpuTimer && benchmarkCapture ? {
+        timestampWrites: {
+          querySet: gpuTimer.querySet,
+          beginningOfPassWriteIndex: 0,
+        },
+      } : {}),
     });
 
 
 
-    pass.setPipeline(preprocess_pipeline);
-
-    // Bind Gaussian inputs, camera matrices, and projected output centers
-    pass.setBindGroup(0, preprocess_bind_group);
+    // Temporarily activate f16 preprocessing when supported
+    const useF16 = useF16Preprocessing;
 
 
 
-    // Bind the existing radix-sort resources required by the compute pipeline
-    pass.setBindGroup(2, sort_bind_group);
+    const key = `${pipelineKey(
+      activePreprocessWorkgroupSize,
+      frustumCullingEnabled
+    )}${useF16 ? '-f16' : ''}`;
+
+
+    if (!loggedPreprocessMode) {
+      console.log('Active Gaussian preprocessing pipeline:', key);
+      loggedPreprocessMode = true;
+    }
+
+
+
+
+    pass.setPipeline(preprocess_pipelines.get(key)!);
+    pass.setBindGroup(0, preprocess_bind_groups.get(key)!);
+
+    pass.setBindGroup(2, sort_bind_groups.get(key)!);
 
 
 
     // Round up to cover all Gaussians, including the final partial workgroup
-    const workgroup_count = Math.ceil(pc.num_points / C.histogram_wg_size);
+    const workgroup_count = Math.ceil(pc.num_points / activePreprocessWorkgroupSize);
 
 
 
@@ -271,8 +566,15 @@ export default function get_renderer(
     encoder: GPUCommandEncoder,
     texture_view: GPUTextureView
   ) => {
+    
     const pass = encoder.beginRenderPass({
       label: 'gaussian quad render',
+      ...(gpuTimer && benchmarkCapture ? {
+        timestampWrites: {
+          querySet: gpuTimer.querySet,
+          endOfPassWriteIndex: 1,
+        },
+      } : {}),
       colorAttachments: [{
         view: texture_view,
         loadOp: 'clear',
@@ -280,10 +582,18 @@ export default function get_renderer(
       }],
     });
 
-    pass.setPipeline(render_pipeline);
 
-    // Make the projected Gaussian centers available to the vertex shader
-    pass.setBindGroup(0, render_bind_group);
+    if (useF16Preprocessing && render_f16_pipeline && render_f16_bind_group) {
+      
+      pass.setPipeline(render_f16_pipeline);
+      pass.setBindGroup(0, render_f16_bind_group);
+
+
+    } else {
+      
+      pass.setPipeline(render_pipeline);
+      pass.setBindGroup(0, render_bind_group);
+    }
 
 
 
@@ -296,6 +606,46 @@ export default function get_renderer(
   //    Return Render Object
   // ===============================================
   return {
+    
+
+    get f16PreprocessingEnabled() {
+      return useF16Preprocessing;
+    },
+
+    get f16PreprocessingSupported() {
+      return supportsShaderF16;
+    },
+
+    setF16Preprocessing: (enabled: boolean) => {
+      useF16Preprocessing = enabled && supportsShaderF16;
+      loggedPreprocessMode = false;
+    },
+
+    get frustumCullingEnabled() {
+      return frustumCullingEnabled;
+    },
+
+    setFrustumCulling: (enabled: boolean) => {
+      frustumCullingEnabled = enabled;
+    },
+
+  
+    
+    
+    get preprocessWorkgroupSize() {
+      return activePreprocessWorkgroupSize;
+    },
+
+
+
+    setPreprocessWorkgroupSize: (size: number) => {
+      if (!PREPROCESS_WG_SIZES.some((supported) => supported === size)) {
+        throw new Error(`Unsupported preprocessing workgroup size: ${size}`);
+      }
+
+      activePreprocessWorkgroupSize = size as PreprocessWorkgroupSize;
+    },
+
     frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
       // Project Gaussians and generate depth keys
       preprocess(encoder);
@@ -310,6 +660,26 @@ export default function get_renderer(
       render(encoder, texture_view);
     },
     camera_buffer,
+
+    setBenchmarkCapture: (enabled: boolean) => {
+      benchmarkCapture = enabled;
+    },
+
+    resolveBenchmark: (encoder: GPUCommandEncoder) => {
+      if (!gpuTimer) {
+        throw new Error('GPU timestamp queries are unavailable');
+      }
+      gpuTimer.resolve(encoder);
+    },
+
+    readBenchmarkMs: async () => {
+      if (!gpuTimer) {
+        throw new Error('GPU timestamp queries are unavailable');
+      }
+
+      const timestamps = await gpuTimer.read();
+      return (timestamps[1] - timestamps[0]) / 1_000_000;
+    },
 
     setGaussianMultiplier: (value: number) => {
       device.queue.writeBuffer(
